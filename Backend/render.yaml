@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: video-downloader-backend
+    env: node
+    region: singapore
+    plan: free
+    buildCommand: |
+      apt-get update && apt-get install -y ffmpeg python3 python3-pip
+      pip install yt-dlp
+      npm install
+    startCommand: node server.js
+    autoDeploy: true
+    envVars:
+      - key: NODE_ENV
+        value: production
