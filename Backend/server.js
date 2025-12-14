@@ -1,3 +1,4 @@
+// backend/server.js
 import express from "express";
 import cors from "cors";
 import { spawn } from "child_process";
@@ -6,77 +7,29 @@ import path from "path";
 import { v4 as uuidv4 } from "uuid";
 
 const app = express();
-
-// -------------------------------------------------------
-// CORS
-// -------------------------------------------------------
-app.use(
-  cors({
-    origin: "*",
-    methods: ["GET", "POST"],
-    allowedHeaders: ["Content-Type"],
-  })
-);
-
 app.use(express.json());
+app.use(cors());
 
-const jobs = {};
-
-// -------------------------------------------------------
-// Downloads directory
-// -------------------------------------------------------
 const DOWNLOAD_DIR = path.join(process.cwd(), "downloads");
 if (!fs.existsSync(DOWNLOAD_DIR)) fs.mkdirSync(DOWNLOAD_DIR);
 
-// -------------------------------------------------------
-// 🔥 COOKIE PATH SUPPORT (LOCAL & RENDER)
-// -------------------------------------------------------
-const LOCAL_COOKIE = path.join(process.cwd(), "cookies.txt");
+// Force add FFmpeg path (Windows Winget)
+process.env.PATH += ";C:\\Users\\admin\\AppData\\Local\\Microsoft\\WinGet\\Packages\\Gyan.FFmpeg_Microsoft.Winget.Source_8wekyb3d8bbwe\\ffmpeg-8.0.1-full_build\\bin";
 
-// On Render, secret files are stored in /etc/secrets
-const SECRET_COOKIE = "/etc/secrets/cookies.txt";
+const jobs = {}; // In-memory job tracking
 
-// Choose correct cookie path:
-const COOKIES_PATH = fs.existsSync(SECRET_COOKIE)
-  ? SECRET_COOKIE
-  : fs.existsSync(LOCAL_COOKIE)
-  ? LOCAL_COOKIE
-  : null;
-
-console.log("🔥 Cookies loaded from:", COOKIES_PATH || "NO COOKIES FOUND!");
-
-// -------------------------------------------------------
-// Test Route
-// -------------------------------------------------------
-app.get("/test", (req, res) => {
-  res.json({
-    status: "Backend OK 🚀",
-    cookies_found: COOKIES_PATH ? true : false,
-    cookies_path: COOKIES_PATH,
-  });
-});
-
-// -------------------------------------------------------
-// /info → Fetch metadata
-// -------------------------------------------------------
+/* =======================
+      /info – metadata
+==========================*/
 app.post("/info", (req, res) => {
   const { url } = req.body;
-  if (!url) return res.status(400).json({ error: "Missing URL" });
+  if (!url) return res.status(400).json({ error: "Missing url" });
 
-  const ytArgs = ["-m", "yt_dlp"];
-
-  // Attach cookies if available
-  if (COOKIES_PATH) ytArgs.push("--cookies", COOKIES_PATH);
-
-  ytArgs.push(
-    "--dump-json",
-    "--no-warnings",
-    "--merge-output-format",
-    "mp4",
-    url
+  const proc = spawn(
+    "python",
+    ["-m", "yt_dlp", "--dump-json", url],
+    { shell: false }
   );
-
-  const proc = spawn("python", ytArgs);
 
   let stdout = "";
   let stderr = "";
@@ -86,119 +39,77 @@ app.post("/info", (req, res) => {
 
   proc.on("close", (code) => {
     if (code !== 0) {
+      console.error("yt-dlp info error:", stderr);
       return res.status(500).json({
-        error: "yt-dlp failed",
+        error: "Failed to fetch info",
         details: stderr,
       });
     }
 
     try {
       const info = JSON.parse(stdout);
-      const formats = info.formats || [];
-
-      // Best video & audio
-      const bestVideo = formats.find((f) => f.vcodec !== "none" && f.ext === "mp4");
-      const bestAudio = formats.find((f) => f.acodec !== "none" && f.vcodec === "none");
-
-      const mergedFormat =
-        bestVideo && bestAudio
-          ? {
-              format_id: `${bestVideo.format_id}+${bestAudio.format_id}`,
-              ext: "mp4",
-              resolution: `${bestVideo.height || 720}p`,
-              note: "Merged (video+audio)",
-            }
-          : null;
-
-      const cleanedFormats = formats
-        .filter((f) => {
-          const isVideo = f.ext === "mp4" && f.vcodec !== "none";
-          const isAudio = f.vcodec === "none" && f.acodec !== "none";
-          return isVideo || isAudio;
-        })
-        .map((f) => ({
-          format_id: f.format_id,
-          ext: f.ext,
-          resolution: f.vcodec === "none" ? "audio" : `${f.height || 0}p`,
-        }));
-
-      if (mergedFormat) cleanedFormats.unshift(mergedFormat);
-
-      res.json({
+      const meta = {
         id: info.id,
         title: info.title,
         thumbnail: info.thumbnail,
         duration: info.duration,
         uploader: info.uploader,
         webpage_url: info.webpage_url,
-        formats: cleanedFormats,
-      });
+        formats: (info.formats || []).map((f) => ({
+          format_id: f.format_id,
+          ext: f.ext,
+          height: f.height || null,
+          filesize: f.filesize || null,
+          format_note: f.format_note || null,
+          acodec: f.acodec,
+          vcodec: f.vcodec,
+        })),
+      };
+      res.json(meta);
     } catch (err) {
-      res.status(500).json({
-        error: "Parse error",
-        details: err.message,
-      });
+      console.error("Parse error:", err);
+      res.status(500).json({ error: "Failed to parse metadata" });
     }
   });
 });
 
-// -------------------------------------------------------
-// /download → Uses cookies for Instagram
-// -------------------------------------------------------
+/* =======================
+   /download – actual file
+==========================*/
 app.post("/download", (req, res) => {
   const { url, format } = req.body;
-  if (!url) return res.status(400).json({ error: "Missing URL" });
+  if (!url) return res.status(400).json({ error: "Missing url" });
 
   const jobId = uuidv4();
-  const outPath = path.join(DOWNLOAD_DIR, `file_${jobId}.%(ext)s`);
+  const outName = `file_${jobId}.%(ext)s`;
+  const outPath = path.join(DOWNLOAD_DIR, outName);
 
-  const args = [
-    "-o",
-    outPath,
-    "--no-warnings",
-    "--newline",
-    "--merge-output-format",
-    "mp4",
-  ];
+  const args = ["-o", outPath, "--no-warnings", "--newline"];
+  if (format) args.push("-f", format);
 
-  if (COOKIES_PATH) args.push("--cookies", COOKIES_PATH);
+  args.push(url); // DO NOT QUOTE URL here
 
-  if (format === "mp3") {
-    args.push(
-      "-f",
-      "bestaudio",
-      "--extract-audio",
-      "--audio-format",
-      "mp3",
-      "--audio-quality",
-      "0"
-    );
-  } else if (url.includes("instagram.com")) {
-    args.push("-f", "bestvideo+bestaudio/best");
-  } else if (format) {
-    args.push("-f", `${format}+bestaudio/best`);
-  } else {
-    args.push("-f", "bestvideo+bestaudio/best");
-  }
-
-  args.push(url);
-
-  const proc = spawn("python", ["-m", "yt_dlp", ...args]);
+  const proc = spawn("python", ["-m", "yt_dlp", ...args], { shell: false });
 
   jobs[jobId] = {
     id: jobId,
+    process: proc,
     status: "running",
     percent: 0,
-    eta: null,
     speed: null,
+    eta: null,
     outputFile: null,
+    stderr: "",
   };
 
+  // Handle yt-dlp output
   const parseProgress = (line) => {
     line = line.toString().trim();
+    if (!line) return;
 
     if (line.includes("Destination:")) {
-      jobs[jobId].outputFile = line.split("Destination:")[1].trim();
+      const filename = line.split("Destination:")[1].trim();
+      jobs[jobId].outputFile = filename;
     }
 
     if (line.startsWith("[download]")) {
@@ -212,29 +123,35 @@ app.post("/download", (req, res) => {
     }
   };
 
-  proc.stdout.on("data", parseProgress);
+  proc.stdout.on("data", (d) => parseProgress(d));
+  proc.stderr.on("data", (d) => {
+    jobs[jobId].stderr += d.toString();
+    parseProgress(d);
+  });
 
-  proc.on("close", () => {
-    const files = fs.readdirSync(DOWNLOAD_DIR);
-    const found = files.find((f) => f.includes(jobId));
-
-    if (found) {
+  proc.on("close", (code) => {
+    if (code === 0) {
       jobs[jobId].status = "finished";
-      jobs[jobId].outputFile = path.join(DOWNLOAD_DIR, found);
+
+      const files = fs.readdirSync(DOWNLOAD_DIR);
+      const found = files.find((f) => f.includes(jobId));
+      if (found) jobs[jobId].outputFile = path.join(DOWNLOAD_DIR, found);
     } else {
       jobs[jobId].status = "error";
+      console.log("YT-DLP ERROR:", jobs[jobId].stderr);
     }
   });
 
   res.json({ jobId });
 });
 
-// -------------------------------------------------------
-// SSE progress
-// -------------------------------------------------------
+/* =======================
+   /progress – SSE updates
+==========================*/
 app.get("/progress/:jobId", (req, res) => {
-  const job = jobs[req.params.jobId];
-  if (!job) return res.status(404).send("Job not found");
+  const { jobId } = req.params;
+
+  if (!jobs[jobId]) return res.status(404).send("Job not found");
 
   res.set({
     "Content-Type": "text/event-stream",
@@ -242,33 +159,45 @@ app.get("/progress/:jobId", (req, res) => {
     Connection: "keep-alive",
   });
 
-  const timer = setInterval(() => {
+  const interval = setInterval(() => {
+    const job = jobs[jobId];
+
     res.write(`event: progress\n`);
     res.write(`data: ${JSON.stringify(job)}\n\n`);
 
     if (job.status === "finished" || job.status === "error") {
-      clearInterval(timer);
+      clearInterval(interval);
       res.write(`event: done\n`);
-      res.write(`data: ${JSON.stringify(job)}\n\n`);
+      res.write(`data: ${JSON.stringify({ status: job.status })}\n\n`);
       res.end();
     }
   }, 700);
+
+  req.on("close", () => clearInterval(interval));
 });
 
-// -------------------------------------------------------
-// /file → return final file
-// -------------------------------------------------------
+/* =======================
+   /file – return finished file
+==========================*/
 app.get("/file/:jobId", (req, res) => {
   const job = jobs[req.params.jobId];
-  if (!job || job.status !== "finished")
-    return res.status(404).send("Not ready");
 
-  res.download(job.outputFile);
+  if (!job) return res.status(404).send("Job not found");
+  if (job.status !== "finished") return res.status(400).send("Not ready");
+
+  const filePath = job.outputFile;
+  if (!filePath || !fs.existsSync(filePath)) return res.status(404).send("File missing");
+
+  res.download(filePath, path.basename(filePath), () => {
+    // Cleanup
+    try {
+      fs.unlinkSync(filePath);
+      delete jobs[req.params.jobId];
+    } catch {}
+  });
 });
 
-// -------------------------------------------------------
-// Start server
-// -------------------------------------------------------
-app.listen(process.env.PORT || 5000, () =>
-  console.log("Backend running on", process.env.PORT || 5000)
-);
+/* =======================*/
+app.listen(5000, () => {
+  console.log("Backend running on port 5000");
+});
